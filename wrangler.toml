@@ -1,0 +1,18 @@
+name = "bingo-tables"
+main = "src/worker.js"
+compatibility_date = "2026-05-01"
+
+# Static frontend served by the Worker via env.ASSETS.
+# The Worker handles /api/* first; everything else is served from ./public.
+[assets]
+directory = "./public"
+binding = "ASSETS"
+not_found_handling = "single-page-application"
+run_worker_first = ["/api/*"]
+
+# Shared game state (rooms + players). `wrangler dev` uses a local SQLite copy,
+# so no remote database is needed for local development or tests.
+[[d1_databases]]
+binding = "DB"
+database_name = "bingo-tables"
+database_id = "local-dev-only"
