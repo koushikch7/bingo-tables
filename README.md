@@ -50,31 +50,35 @@ ever drift.
 
 ### Board geometry drives everything
 
-Rows and columns are not cosmetic — they determine the item pool:
+Rows and columns are not cosmetic — they determine the number pool:
 
 ```
 numbers per column = min(3 × rows, 99 / cols)
 total numbers      = numbers per column × columns
 ```
 
-So the classic **5 × 5** board is exactly standard 75-ball bingo (15
-numbers per column × 5 columns = 75). A **6 × 8** board gives 96 numbers
-(16 per column × 6 columns = 96), etc. The column ranges **never overlap**,
-so column C always draws from its own slice.
+So the classic **5 × 5** board is exactly standard 75-ball bingo (15 numbers per
+column, B-I-N-G-O). A **6 × 8** board for a big room produces 96 numbers, 12 per
+column. Every cell stays two digits so cards stay readable on a phone.
 
 ### Choosing a board for your group
 
-| Expected players | Recommended board | Note |
-| --- | --- | --- |
-| ≤ 12 | 4 × 4 | cosy tables |
-| ≤ 30 | 5 × 5 | classic 75-ball |
-| ≤ 80 | 5 × 6 | medium rooms |
-| ≤ 150 | 5 × 7 | large rooms |
-| ≤ 300 | 6 × 6 | halls |
-| > 300 | 6 × 8 | very large groups |
+More players means more cards, which means someone completes a line sooner — so
+bigger groups get bigger cards to keep the round from ending on the third call.
+The settings panel has an **Expected players** box that recommends a board:
 
-The **Recommend board** button in the lobby does this automatically from
-`expectedPlayers`.
+| Expected players | Board | Numbers |
+| --- | --- | --- |
+| 4–12 | 4 × 4 | 48 |
+| 13–30 | 5 × 5 | 75 |
+| 31–80 | 5 × 6 | 90 |
+| 81–150 | 5 × 7 | 98 |
+| 151–300 | 6 × 6 | 96 |
+| 301–500 | 6 × 8 | 96 |
+
+The panel also reports **card variety**. When a column holds barely more numbers
+than a card needs, cards repeat and simultaneous winners get common — useful to
+know before a 500-player round.
 
 ### What goes on the card
 
@@ -98,6 +102,11 @@ The pool is served from its own endpoint (`GET /pool`) with a version cursor, so
 a 500-player room does not re-send 90 items on every poll.
 
 ### Patterns and winners
+
+Patterns are generated from the board, so "rows 1/2/3" and "columns 1/2/3" are
+simply `row:0`–`row:2` and `col:0`–`col:2`. Presets: **Classic lines**, **All
+rows**, **All columns**, **Diagonals**, **Four corners**, **Blackout**, or pick
+each one by hand.
 
 A player wins by completing **any** enabled pattern. "Blackout" obviously means
 the whole card. With multiple winners the round stays open until the last place
@@ -131,10 +140,19 @@ Both can be switched off by the host, and the API answers `403` when they are.
 
 ```bash
 npm install
-npm run dev   # http://localhost:3000
+npm test                          # unit tests for the shared rules
+npm run dev                       # wrangler dev → http://localhost:8787
+node scripts/smoke.mjs            # end-to-end API suite
+node scripts/smoke.mjs --scale    # ...plus a 500-player load check
 ```
 
-The dev server spins up a local D1 database automatically — no extra setup.
+`wrangler dev` uses a **local** D1 database (SQLite under `.wrangler/`), so no
+cloud account or remote database is needed to develop or test.
+
+> **Upgrading from an earlier build?** The schema changed. `ensureSchema` detects
+> a pre-launch database with the old shape and rebuilds it, since there is no
+> data worth preserving yet. Replace that guard with a real migration before the
+> app holds live data.
 
 ## Architecture
 
@@ -156,18 +174,26 @@ docs/
 
 ### How this scales to 500 players
 
-- **Cards are derived, never stored** — a pure function of `(room seed, round,
-  player id)`. Dealing a round costs the same for 4 or 500 players: **zero
-  per-player writes**.
-- **GET `/state` is O(1)** in player count: one room read, one seat read, no
-  roster scan. Numbers the client already has are not resent (`?since=` tail).
-- **Draw clock** is advanced by pollers, writes only when a draw is due, and
-  uses a compare-and-swap so racing pollers cannot draw twice.
-- **Automatic winner check** runs only when the called set changes — it never
-  scans 500 players per dab.
-- **Roster, leaderboard, item pool, chat, reactions** are separate endpoints,
-  each with its own cursor and throttle.
-- **`last_seen` updates ≤ 1 / 15 s / player** — not per poll.
+The hot path is `GET /state`, polled about once a second per player. It is kept
+O(1) in table size:
+
+- **Cards are derived, never stored.** A card is a pure function of
+  `(room seed, round, player id)`, so dealing a round costs the same for 4 or
+  500 players — there is no per-player write, not even a reset between rounds.
+- **Auto dabbing stores nothing.** A cell is dabbed exactly when its number has
+  been called, so marks are computed on read.
+- **The draw clock only writes when a draw is due**, using a compare-and-swap on
+  the called count so pollers arriving together cannot call two numbers.
+- **Called numbers are sent incrementally** — a client that is caught up
+  receives only the new ones.
+- **The roster and leaderboard are separate endpoints.** The roster is fetched
+  only when it changes; the leaderboard only when enabled and throttled, capped
+  and cached per isolate.
+- **`last_seen` is written at most once every 15s per player**, not per poll.
+- **The client polls more slowly in bigger rooms** (~1s under 40 players, ~2s
+  at 500).
+
+Measured on a local `wrangler dev` with **500 seats in one room**:
 
 | Metric | Result |
 | --- | --- |
@@ -178,11 +204,7 @@ docs/
 | 499 joins | 12.5 ms each |
 | Roster payload | 43 KB for 500 players (fetched only on change) |
 
-All numbers from `node scripts/smoke.mjs --scale` (194 checks, 0 failures).
-
 ## API
-
-All routes are under `/api`. Auth is the `x-player-token` header (or `?token=`).
 
 | Method | Path | Purpose |
 | --- | --- | --- |
@@ -205,13 +227,17 @@ All routes are under `/api`. Auth is the `x-player-token` header (or `?token=`).
 | `POST` | `/api/room/:code/leave` | Give up your seat (the host cannot) |
 | `GET` | `/api/health` | Liveness check |
 
+Player identity is a random token sent in the `x-player-token` header, kept in
+`localStorage` so a refresh drops you back into your seat. This is a casual
+party game — tokens are seat identifiers, not accounts.
+
 ## Deploying
 
-1. Provision a D1 database: `wrangler d1 create bingo-tables`
-2. Put its `database_id` in `wrangler.toml` (replace `local-dev-only`)
-3. Run the migration once: `wrangler d1 execute bingo-tables --remote --file=./schema.sql`
-   (the schema lives in `src/worker.js` under `ensureSchema()`; extract it)
-4. `npm run deploy` → your Worker is live.
+The app targets Workers + a D1 binding named `DB`. Add a real database id to
+`wrangler.toml` (or attach the binding through your hosting platform) and run:
 
-> **Note:** The repo includes no production D1 binding — the `database_id` in
-> `wrangler.toml` is a placeholder. The local dev server works out of the box.
+```bash
+npx wrangler deploy
+```
+
+Tables are created on first use, so there is no separate migration step.
