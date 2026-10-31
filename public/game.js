@@ -120,6 +120,11 @@ export function numbersPerColumn(rows, cols) {
  * Turn a config into the room's callable pool.
  * Items are `{ label, media }`; `media` is an optional link (used by music or
  * host-supplied image URLs). Cells store an item's index into this array.
+ *
+ * A host-supplied list wins over the built-in pool for every non-numeric
+ * content type — that is how "upload my images/names" works for images, mixed
+ * and names boards alike. Numbers stay machine-generated: a numeric bingo has
+ * no meaningful uploads.
  */
 export function buildPool({ content, rows, cols, customItems }) {
   if (content === 'numbers') {
@@ -132,27 +137,29 @@ export function buildPool({ content, rows, cols, customItems }) {
     };
   }
 
-  let source = [];
-  if (content === 'custom') {
-    source = (Array.isArray(customItems) ? customItems : []).map(normaliseItem).filter(Boolean);
-  } else {
-    source = poolFor(content).map(normaliseItem).filter(Boolean);
-  }
+  const host = Array.isArray(customItems) ? customItems.map(normaliseItem).filter(Boolean) : [];
+  const source = content === 'custom' || host.length > 0 ? host : poolFor(content).map(normaliseItem).filter(Boolean);
 
   const perColumn = Math.floor(source.length / cols);
   const size = perColumn * cols;
   return { items: source.slice(0, size), perColumn, poolSize: size };
 }
 
-function normaliseItem(raw) {
+export function normaliseItem(raw) {
   if (typeof raw === 'string') {
     const label = raw.trim().slice(0, 40);
     return label ? { label, media: '' } : null;
   }
   if (raw && typeof raw === 'object') {
     const label = String(raw.label ?? '').trim().slice(0, 40);
-    const media = String(raw.media ?? '').trim().slice(0, 300);
-    return label ? { label, media } : null;
+    const rawMedia = String(raw.media ?? '').trim();
+    // A pasted link is capped small; an uploaded image is capped by
+    // `image_too_large` in normalizeConfig, and only ever trimmed here as a
+    // last resort (the browser downscales uploads before they leave).
+    const limit = rawMedia.startsWith('data:image/') ? MEDIA_DATA_MAX : MEDIA_LINK_MAX;
+    const media = rawMedia.slice(0, limit);
+    // Image-only cells are legal: the caption is optional for uploads.
+    return label || media ? { label, media } : null;
   }
   return null;
 }
@@ -426,6 +433,13 @@ export const DEFAULT_SECONDS = 5;
 export const ALLOWED_INTERVALS = [3000, 4000, 5000, 8000, 12000, 20000];
 export const MAX_CUSTOM_ITEMS = 300;
 
+/** A pasted link stays short — it is only a pointer. */
+export const MEDIA_LINK_MAX = 300;
+/** An uploaded image is a downscaled data URL; bigger is refused outright. */
+export const MEDIA_DATA_MAX = 5000;
+/** The whole pool must stay far under the database row limit (1 MiB). */
+export const MAX_POOL_BYTES = 400_000;
+
 export function defaultConfig() {
   const rows = 5;
   const cols = 5;
@@ -468,8 +482,8 @@ export function fieldVisibility(config) {
     winningCondition: config.winnerMode === 'single',
     // A cap only means something when more than one player can win.
     maxWinners: config.winnerMode === 'multiple',
-    // Only needed when the host is supplying the list.
-    customItems: config.content === 'custom',
+    // Any non-numeric board can be host-supplied (typed list or uploads).
+    customItems: config.content !== 'numbers',
     // Non-numeric content has its own pool guidance.
     poolDetails: config.content !== 'numbers',
     // The "you missed some" hint is pointless when dabbing is automatic.
@@ -517,18 +531,45 @@ export function normalizeConfig(raw, base) {
     if (input.customItems.length > MAX_CUSTOM_ITEMS) {
       return { error: 'too_many_items', message: `Keep custom lists to ${MAX_CUSTOM_ITEMS} entries or fewer.` };
     }
+    for (const item of input.customItems) {
+      const media = item && typeof item === 'object' ? String(item.media ?? '').trim() : '';
+      if (media.startsWith('data:') && media.length > MEDIA_DATA_MAX) {
+        return {
+          error: 'image_too_large',
+          message: `One of those images is ${Math.round(media.length / 1024)} KB as text — uploads must be under ${Math.round(MEDIA_DATA_MAX / 1024)} KB after shrinking.`,
+        };
+      }
+    }
+    // A host list that survives nothing is refused rather than quietly swapped
+    // for the built-in pool: the host asked for their own items, and "none of
+    // them were usable" is the honest answer. An explicitly empty list, on the
+    // other hand, means "use the built-in pool" and is left alone.
+    if (next.content !== 'custom' && input.customItems.length > 0 && input.customItems.every((item) => normaliseItem(item) === null)) {
+      return {
+        error: 'invalid_items',
+        message: 'None of those entries could be used — every item needs a name, a picture, or a link.',
+      };
+    }
     next.customItems = input.customItems;
   }
 
   const pool = buildPool({ content: next.content, rows: next.rows, cols: next.cols, customItems: next.customItems });
   const needed = minimumPoolSize(next.rows, next.cols);
   if (pool.poolSize < needed) {
+    const hostList = next.content === 'custom' || (Array.isArray(next.customItems) && next.customItems.length > 0);
     return {
       error: 'pool_too_small',
-      message:
-        next.content === 'custom'
-          ? `You need at least ${needed} items for a ${next.rows}x${next.cols} board (${needed / next.cols} per column), or reduce the columns.`
-          : 'That content pool is too small for this board.',
+      message: hostList
+        ? `You need at least ${needed} items for a ${next.rows}x${next.cols} board (${needed / next.cols} per column), or reduce the columns.`
+        : 'That content pool is too small for this board.',
+    };
+  }
+
+  const poolBytes = JSON.stringify(pool.items).length;
+  if (poolBytes > MAX_POOL_BYTES) {
+    return {
+      error: 'items_too_large',
+      message: `That list comes to ${Math.round(poolBytes / 1024)} KB — keep the pool under ${MAX_POOL_BYTES / 1024} KB by shrinking the images or trimming the list.`,
     };
   }
 

@@ -1,14 +1,17 @@
 import {
   AVATAR_CHOICES,
   MAX_COLS,
+  MAX_CUSTOM_ITEMS,
   MAX_ROWS,
   MIN_COLS,
   MIN_ROWS,
   REACTION_EMOJIS,
   availablePatterns,
   hasFreeCentre,
+  minimumPoolSize,
   numbersPerColumn,
   patternCells,
+  poolFor,
   presetPatterns,
   recommendBoard,
   variety,
@@ -44,6 +47,10 @@ let lastRosterAt = 0;
 let lastLeaderboardAt = 0;
 let lastSocialAt = 0;
 let selectedTarget = null;
+// Host studio: what the card is made of when it is not a built-in pool.
+let contentSource = 'builtin'; // 'builtin' (use the shipped pool) | 'mine' (typed list + uploads)
+let draftUploads = []; // [{ label, media }] — pictures the host uploaded this session
+let reactionCooldownUntil = 0; // one emoji a minute, mirrored from the server
 
 let busy = false;
 let pollTimer = null;
@@ -128,6 +135,10 @@ function messageFor(data, fallback = 'Something went wrong. Try again.') {
     no_patterns: 'Pick at least one winning pattern.',
     pool_too_small: data && data.message,
     too_many_items: data && data.message,
+    items_too_large: data && data.message,
+    image_too_large: data && data.message,
+    invalid_items: data && data.message || 'Your item list did not look right.',
+    rate_limited: data && data.message || 'One emoji a minute per player.',
     too_many_words: data && data.message,
     message_too_long: data && data.message,
     empty_message: 'Type something first.',
@@ -177,7 +188,12 @@ function itemFor(index) {
 
 function itemLabel(index) {
   const item = itemFor(index);
-  return item ? item.label : `#${index + 1}`;
+  if (!item) return `#${index + 1}`;
+  if (item.label) return item.label;
+  // An image-only cell still needs words on the called-items board.
+  if (isEmojiLabel(item.media)) return item.media;
+  if (item.media) return '🖼️';
+  return `#${index + 1}`;
 }
 
 function isEmojiLabel(label) {
@@ -192,29 +208,36 @@ function cellHtml(index) {
   const media = item.media || '';
 
   if (content === 'mixed' && media) {
-    return `${cellMedia(media)}<span class="cell-text tiny">${esc(label)}</span>`;
+    return cellMedia(media) + (label ? `<span class="cell-text tiny">${esc(label)}</span>` : '');
   }
   if (content === 'images') {
-    return cellMedia(label);
+    return cellMedia(media || label);
   }
   if (isEmojiLabel(label)) {
     return `<span class="cell-media">${esc(label)}</span>`;
   }
   if (media) {
-    return `${cellMedia(media)}<span class="cell-text tiny">${esc(label)}</span>`;
+    return cellMedia(media) + (label ? `<span class="cell-text tiny">${esc(label)}</span>` : '');
   }
   return `<span class="cell-text">${esc(label)}</span>`;
 }
 
 /**
- * A pool item may be an emoji, or a real image URL when the host pasted custom
- * items. Both are rendered inline so a 6x8 card stays readable at scale.
+ * A pool item may be an emoji, a link, or an uploaded picture (a small data
+ * URL). All three are rendered inline so a 6x8 card stays readable at scale.
  */
 function cellMedia(value) {
-  if (/^https?:\/\//i.test(value)) {
+  if (/^https?:\/\//i.test(value) || /^data:image\//i.test(value)) {
     return `<img class="cell-image" src="${esc(value)}" alt="" loading="lazy" />`;
   }
   return `<span class="cell-media">${esc(value)}</span>`;
+}
+
+/** Seats, rosters and chat show an emoji — or the player's uploaded photo. */
+function avatarFace(value, cls) {
+  const avatar = value || '🙂';
+  if (/^data:image\//i.test(avatar)) return `<img class="${cls} photo" src="${esc(avatar)}" alt="" />`;
+  return `<span class="${cls}">${esc(avatar)}</span>`;
 }
 
 // ------------------------------------------------------------------ home ---
@@ -225,7 +248,11 @@ function renderHome(message = '') {
   viewer = null;
   resetLocalCaches();
   const savedName = session && session.name ? session.name : '';
-  const savedAvatar = pickAvatar(savedName);
+  // A photo the player uploaded last time survives a reload; otherwise pick a
+  // deterministic emoji from their name.
+  const savedPhoto =
+    session && typeof session.avatar === 'string' && /^data:image\//i.test(session.avatar) ? session.avatar : '';
+  const savedAvatar = savedPhoto || pickAvatar(savedName);
 
   app.innerHTML = `
     <div class="home">
@@ -238,7 +265,7 @@ function renderHome(message = '') {
           <input id="name" maxlength="18" placeholder="e.g. Alex" autocomplete="nickname" value="${esc(savedName)}" />
         </label>
         <div class="field">
-          <span>Your avatar</span>
+          <span>Your avatar <em>(emoji or your own photo)</em></span>
           <div class="avatar-picker" id="avatar-picker">
             ${AVATAR_CHOICES.slice(0, 12)
               .map(
@@ -246,6 +273,10 @@ function renderHome(message = '') {
                   `<button type="button" class="avatar-option ${a === savedAvatar ? 'picked' : ''}" data-avatar="${a}">${a}</button>`
               )
               .join('')}
+            <label class="avatar-option avatar-photo ${savedPhoto ? 'picked' : ''}" id="avatar-photo" title="Upload a photo">
+              <span id="avatar-photo-face">${savedPhoto ? `<img src="${savedPhoto}" alt="" />` : '📷'}</span>
+              <input type="file" id="avatar-file" accept="image/*" />
+            </label>
           </div>
         </div>
 
@@ -269,12 +300,30 @@ function renderHome(message = '') {
   const codeEl = document.getElementById('code');
   const errorEl = document.getElementById('form-error');
   let avatar = savedAvatar;
+  let photo = savedPhoto;
 
   document.getElementById('avatar-picker').addEventListener('click', (event) => {
     const button = event.target.closest('[data-avatar]');
     if (!button) return;
     avatar = button.dataset.avatar;
     document.querySelectorAll('.avatar-option').forEach((el) => el.classList.toggle('picked', el === button));
+  });
+
+  const photoInput = document.getElementById('avatar-file');
+  photoInput.addEventListener('change', async () => {
+    const file = photoInput.files && photoInput.files[0];
+    photoInput.value = '';
+    if (!file) return;
+    try {
+      // Avatars stay tiny (64px) so a 500-player roster remains light.
+      photo = await shrinkImage(file, { max: 64, maxChars: 1900 });
+      avatar = photo;
+      document.getElementById('avatar-photo-face').innerHTML = `<img src="${photo}" alt="" />`;
+      document.querySelectorAll('.avatar-option').forEach((el) => el.classList.toggle('picked', el.id === 'avatar-photo'));
+      errorEl.textContent = '';
+    } catch (error) {
+      errorEl.textContent = 'That picture would not shrink small enough — try another image.';
+    }
   });
 
   codeEl.addEventListener('input', () => {
@@ -293,7 +342,7 @@ function renderHome(message = '') {
       errorEl.textContent = messageFor(data, 'Could not create a table.');
       return;
     }
-    saveSession({ code: data.room.code, token: data.token, role: 'host' });
+    saveSession({ code: data.room.code, token: data.token, role: 'host', name: nameEl.value.trim() || 'Host' });
     applyState(data);
     enterRoom();
   });
@@ -320,7 +369,7 @@ function renderHome(message = '') {
       errorEl.textContent = messageFor(data);
       return;
     }
-    saveSession({ code: data.room.code, token: data.token, role: 'player' });
+    saveSession({ code: data.room.code, token: data.token, role: 'player', name: nameEl.value.trim() || 'Player', avatar });
     applyState(data);
     enterRoom();
   };
@@ -372,6 +421,13 @@ function resetLocalCaches() {
   currentSkeleton = '';
   configDirty = false;
   configSig = '';
+  contentSource = 'builtin';
+  draftUploads = [];
+  reactionCooldownUntil = 0;
+  if (reactionCooldownTimer) {
+    clearInterval(reactionCooldownTimer);
+    reactionCooldownTimer = null;
+  }
   for (const key of Object.keys(pieceSigs)) delete pieceSigs[key];
 }
 
@@ -396,7 +452,8 @@ function isHost() {
 }
 
 function skeletonKey() {
-  const { room, config } = state;
+  const { room } = state;
+  const config = room.config;
   return [
     room.status,
     isHost() ? 'host' : 'player',
@@ -488,12 +545,31 @@ function renderStudioPanel() {
         <div class="choice-row" id="content-row">
           ${contentChoices(config.content)}
         </div>
+
+        <div id="source-block" class="hidden">
+          <div class="choice-row" id="source-row">
+            <label class="choice"><input type="radio" name="contentSource" value="builtin" ${contentSource === 'builtin' ? 'checked' : ''} /> Built-in pool</label>
+            <label class="choice"><input type="radio" name="contentSource" value="mine" ${contentSource === 'mine' ? 'checked' : ''} /> My own images &amp; names</label>
+          </div>
+        </div>
+
         <div id="custom-block" class="hidden">
           <label class="field">
             <span>Your list <em>(one per line, or “Name | link”)</em></span>
             <textarea id="cfg-custom" rows="5" placeholder="Sunrise&#10;Moonlight&#10;Mount Fuji"></textarea>
           </label>
+          <div class="item-tools">
+            <span class="hint">Auto-fill:</span>
+            <button type="button" class="ghost small" data-autofill="numbers">🔢 Numbers 1…N</button>
+            <button type="button" class="ghost small" data-autofill="names">👤 Names</button>
+            <button type="button" class="ghost small" data-autofill="emoji">🖼️ Emoji</button>
+            <label class="ghost small upload-btn">📤 Upload images…<input type="file" id="cfg-upload" accept="image/*" multiple /></label>
+            <button type="button" class="ghost small" id="cfg-clear">Clear</button>
+          </div>
+          <div id="upload-grid" class="upload-grid hidden"></div>
         </div>
+
+        <p class="hint pool-status" id="pool-status"></p>
       </fieldset>
 
       <span id="geometry-block">
@@ -588,11 +664,13 @@ function renderStudioPanel() {
       <p class="form-error" id="cfg-error"></p>
     </form>`;
 
-  document.getElementById('cfg-custom').value = customToText(config.customItems);
+  document.getElementById('cfg-custom').value = '';
   setContentFields();
   drawPatternList(config.winPatterns);
   applyVisibility();
   updatePreview();
+  attachItemTools();
+  fillItemsFromPool(); // seed the editor from the pool the server already holds
 
   const form = document.getElementById('config-form');
   form.addEventListener('input', () => {
@@ -628,6 +706,9 @@ function renderStudioPanel() {
     const button = event.target.closest('[data-content]');
     if (!button) return;
     document.getElementById('content-row').querySelectorAll('[data-content]').forEach((el) => el.classList.toggle('picked', el === button));
+    // "My own list" is the natural reading of the custom type; the other
+    // types keep whatever source the host last chose (builtin vs mine).
+    if (button.dataset.content === 'custom') setSource('mine');
     setContentFields();
     configDirty = true;
     applyVisibility();
@@ -681,22 +762,272 @@ function contentChoices(current) {
     .join('');
 }
 
-function setContentFields() {
+function currentContent() {
   const pick = document.querySelector('#content-row [data-content].picked');
-  const content = pick ? pick.dataset.content : 'numbers';
-  document.getElementById('custom-block').classList.toggle('hidden', content !== 'custom');
+  return pick ? pick.dataset.content : 'numbers';
+}
+
+function setSource(value) {
+  contentSource = value === 'mine' ? 'mine' : 'builtin';
+  document.querySelectorAll('input[name="contentSource"]').forEach((radio) => {
+    radio.checked = radio.value === contentSource;
+  });
+}
+
+/** True when the card is made of the host's own list rather than a shipped pool. */
+function currentSource() {
+  const picked = document.querySelector('input[name="contentSource"]:checked');
+  return picked ? picked.value : contentSource;
+}
+
+function listMode(content = currentContent()) {
+  return content === 'custom' || (content !== 'numbers' && currentSource() === 'mine');
+}
+
+/** Typed lines plus uploaded pictures — everything the host has supplied. */
+function draftItems() {
+  const textarea = document.getElementById('cfg-custom');
+  const typed = textarea ? parseCustom(textarea.value) : [];
+  return [...typed, ...draftUploads];
+}
+
+function setContentFields() {
+  const content = currentContent();
+  const sourceBlock = document.getElementById('source-block');
+  const customBlock = document.getElementById('custom-block');
+  if (!sourceBlock || !customBlock) return;
+  const builtInable = content !== 'numbers' && content !== 'custom';
+  sourceBlock.classList.toggle('hidden', !builtInable);
+  customBlock.classList.toggle('hidden', !listMode(content));
+  updatePoolStatus();
+}
+
+/**
+ * Always-on validation: the board needs rows × cols items, and the host sees
+ * the count on every content type — never a surprise refusal on save.
+ */
+function updatePoolStatus() {
+  const el = document.getElementById('pool-status');
+  if (!el) return;
+  const rows = Number(document.getElementById('cfg-rows').value);
+  const cols = Number(document.getElementById('cfg-cols').value);
+  const content = currentContent();
+  const needed = minimumPoolSize(rows, cols);
+  const say = (text, kind) => {
+    el.className = `hint pool-status ${kind}`;
+    el.textContent = text;
+  };
+
+  if (content === 'numbers') {
+    const perColumn = numbersPerColumn(rows, cols);
+    say(`Auto-generated: ${perColumn * cols} numbers to call for ${needed} cells — always enough.`, 'ok');
+    return;
+  }
+
+  if (!listMode(content)) {
+    const size = poolFor(content).length;
+    const short = size < needed;
+    say(
+      short
+        ? `Built-in pool: ${size} items — a ${rows}×${cols} board needs ${needed}. Switch to “My own” and add more.`
+        : `Built-in pool: ${size} items — a ${rows}×${cols} board needs ${needed}. ✓`,
+      short ? 'short' : 'ok'
+    );
+    return;
+  }
+
+  if (poolVersion === null && state && state.room && state.room.config.content !== 'numbers') {
+    say('Loading your saved list…', '');
+    return;
+  }
+
+  const items = draftItems();
+  const missing = needed - items.length;
+  if (items.length > MAX_CUSTOM_ITEMS) {
+    say(`${items.length} items — the maximum is ${MAX_CUSTOM_ITEMS}. Remove ${items.length - MAX_CUSTOM_ITEMS}.`, 'short');
+  } else if (missing > 0) {
+    say(`${items.length} of ${needed} items — add ${missing} more (type them, auto-fill, or upload pictures).`, 'short');
+  } else {
+    const pictures = draftUploads.length ? `${draftUploads.length} uploaded picture${draftUploads.length === 1 ? '' : 's'}, ` : '';
+    say(`${items.length} of ${needed} items ✓ — ${pictures}every cell is covered.`, 'ok');
+  }
+}
+
+/** Does the shipped pool for this type already match what the server stored? */
+function isBuiltinPool(content, items) {
+  const built = poolFor(content).map((entry) => (typeof entry === 'string' ? entry : entry.label || ''));
+  const cols = Number(document.getElementById('cfg-cols').value) || 1;
+  if (Math.floor(built.length / cols) * cols !== items.length) return false;
+  return items.every((item, index) => (item.label || '') === String(built[index] || ''));
+}
+
+/**
+ * Re-open the host's saved list: text items land in the textarea, uploaded
+ * pictures become thumbnails. Runs when the pool arrives, so a reload or a
+ * second host session shows exactly what was saved last time.
+ */
+function fillItemsFromPool() {
+  const textarea = document.getElementById('cfg-custom');
+  if (!textarea || !state || !state.room || configDirty) return;
+  const content = state.room.config.content;
+  if (content === 'numbers' || !pool || poolVersion === null) return;
+
+  const typed = [];
+  const uploads = [];
+  for (const item of pool.items || []) {
+    const label = item.label || '';
+    const media = item.media || '';
+    if (media.startsWith('data:')) uploads.push({ label, media });
+    else typed.push(media ? `${label} | ${media}` : label);
+  }
+
+  draftUploads = uploads;
+  textarea.value = typed.join('\n');
+  setSource(content === 'custom' || uploads.length > 0 || !isBuiltinPool(content, pool.items || []) ? 'mine' : 'builtin');
+  renderUploadGrid();
+  setContentFields();
+}
+
+function renderUploadGrid() {
+  const grid = document.getElementById('upload-grid');
+  if (!grid) return;
+  grid.classList.toggle('hidden', draftUploads.length === 0);
+  grid.innerHTML = draftUploads
+    .map(
+      (upload, index) => `
+        <figure class="upload-item">
+          <img src="${upload.media}" alt="" />
+          <figcaption>
+            <input type="text" maxlength="40" data-upload-label="${index}" value="${esc(upload.label)}" placeholder="Name (optional)" />
+          </figcaption>
+          <button type="button" class="upload-drop" data-upload-drop="${index}" title="Remove">✕</button>
+        </figure>`
+    )
+    .join('');
+
+  grid.querySelectorAll('[data-upload-label]').forEach((input) => {
+    input.addEventListener('input', () => {
+      draftUploads[Number(input.dataset.uploadLabel)].label = input.value.trim();
+      configDirty = true;
+      updatePoolStatus();
+    });
+  });
+  grid.querySelectorAll('[data-upload-drop]').forEach((button) => {
+    button.addEventListener('click', () => {
+      draftUploads.splice(Number(button.dataset.uploadDrop), 1);
+      configDirty = true;
+      renderUploadGrid();
+      updatePoolStatus();
+    });
+  });
+}
+
+/**
+ * Shrink a picked picture to a small JPEG data URL. `max` is the longest edge
+ * in pixels; `maxChars` is the text budget the server enforces, so oversized
+ * uploads are rejected here with a clear error instead of a broken cell.
+ */
+async function shrinkImage(file, { max = 96, maxChars = 4800 } = {}) {
+  const bitmap = await createImageBitmap(file);
+  const canvas = document.createElement('canvas');
+  const ctx = canvas.getContext('2d');
+  const steps = [
+    [1, 0.72],
+    [0.75, 0.65],
+    [0.56, 0.6],
+    [0.5, 0.55],
+  ];
+  let encoded = '';
+  for (const [fraction, quality] of steps) {
+    const size = Math.max(24, Math.round(max * fraction));
+    const scale = Math.min(1, size / Math.max(bitmap.width, bitmap.height));
+    canvas.width = Math.max(1, Math.round(bitmap.width * scale));
+    canvas.height = Math.max(1, Math.round(bitmap.height * scale));
+    ctx.fillStyle = '#ffffff'; // JPEG has no alpha channel
+    ctx.fillRect(0, 0, canvas.width, canvas.height);
+    ctx.drawImage(bitmap, 0, 0, canvas.width, canvas.height);
+    encoded = canvas.toDataURL('image/jpeg', quality);
+    if (encoded.length <= maxChars) break;
+  }
+  if (bitmap.close) bitmap.close();
+  if (encoded.length > maxChars) throw new Error('image_too_large');
+  return encoded;
+}
+
+async function handleUploadFiles(files) {
+  const picked = [...(files || [])].filter((file) => file.type.startsWith('image/'));
+  const input = document.getElementById('cfg-upload');
+  if (input) input.value = '';
+  if (!picked.length) {
+    toast('Choose one or more image files.');
+    return;
+  }
+
+  const names = currentContent() === 'mixed' ? poolFor('names') : [];
+  const used = new Set(draftItems().map((item) => (typeof item === 'string' ? item : item.label || '')));
+  for (const file of picked) {
+    try {
+      // Mixed cards pair a name with the picture, so every upload gets one.
+      let label = '';
+      if (names.length) {
+        label = names.find((name) => !used.has(name)) || '';
+        used.add(label);
+      }
+      draftUploads.push({ label, media: await shrinkImage(file) });
+    } catch (error) {
+      toast(`Could not add ${file.name} — try a smaller or standard image file.`);
+    }
+  }
+  renderUploadGrid();
+  configDirty = true;
+  updatePoolStatus();
+}
+
+/** Auto-fill and upload controls, wired once per studio render. */
+function attachItemTools() {
+  document.querySelectorAll('input[name="contentSource"]').forEach((radio) => {
+    radio.addEventListener('change', () => {
+      contentSource = radio.value;
+      configDirty = true;
+      setContentFields();
+      updatePreview();
+    });
+  });
+
+  document.querySelectorAll('[data-autofill]').forEach((button) => {
+    button.addEventListener('click', () => {
+      const rows = Number(document.getElementById('cfg-rows').value);
+      const cols = Number(document.getElementById('cfg-cols').value);
+      const needed = minimumPoolSize(rows, cols);
+      const kind = button.dataset.autofill;
+      const items =
+        kind === 'numbers' ? range(1, needed) : (kind === 'names' ? poolFor('names') : poolFor('images')).slice(0, needed);
+      document.getElementById('cfg-custom').value = items.join('\n');
+      configDirty = true;
+      document.getElementById('cfg-error').textContent = '';
+      updatePoolStatus();
+      updatePreview();
+    });
+  });
+
+  const upload = document.getElementById('cfg-upload');
+  if (upload) upload.addEventListener('change', () => handleUploadFiles(upload.files));
+
+  const clear = document.getElementById('cfg-clear');
+  if (clear) {
+    clear.addEventListener('click', () => {
+      document.getElementById('cfg-custom').value = '';
+      draftUploads = [];
+      configDirty = true;
+      renderUploadGrid();
+      updatePoolStatus();
+    });
+  }
 }
 
 function matchesCondition(config, id) {
   const target = presetPatterns(id, config.rows, config.cols);
   return target.length === config.winPatterns.length && target.every((p) => config.winPatterns.includes(p));
-}
-
-function customToText(items) {
-  if (!Array.isArray(items)) return '';
-  return items
-    .map((i) => (typeof i === 'string' ? i : `${i && i.label ? i.label : ''}${i && i.media ? ` | ${i.media}` : ''}`))
-    .join('\n');
 }
 
 function parseCustom(text) {
@@ -755,7 +1086,11 @@ function readForm() {
     reactions: document.getElementById('cfg-reactions').checked,
     expectedPlayers: Number(document.getElementById('cfg-expected').value) || 0,
   };
-  if (content === 'custom') config.customItems = parseCustom(document.getElementById('cfg-custom').value);
+  if (content !== 'numbers') {
+    // "My own" sends typed lines + uploaded pictures; the built-in choice
+    // explicitly clears anything saved before, so uploads never leak back in.
+    config.customItems = listMode(content) ? draftItems() : [];
+  }
   return config;
 }
 
@@ -789,6 +1124,8 @@ function applyVisibility() {
         ? 'The table declares a winner the moment a card completes the pattern — no shouting needed.'
         : 'Players press Bingo; the table verifies the claim.';
   }
+
+  updatePoolStatus();
 }
 
 function updatePreview() {
@@ -813,6 +1150,20 @@ async function saveConfig(thenStart) {
   if (patternCount === 0) {
     errorEl.textContent = 'Pick at least one winning pattern.';
     return;
+  }
+
+  // The board must always be fully supplied — say so here rather than letting
+  // the server refuse with pool_too_small after a round trip.
+  if (listMode(draft.content)) {
+    const needed = minimumPoolSize(draft.rows, draft.cols);
+    if (draft.customItems.length < needed) {
+      errorEl.textContent = `Your list has ${draft.customItems.length} items — a ${draft.rows}×${draft.cols} board needs ${needed}. Type more lines, use auto-fill, or upload pictures.`;
+      return;
+    }
+    if (draft.customItems.length > MAX_CUSTOM_ITEMS) {
+      errorEl.textContent = `That list has ${draft.customItems.length} items — the maximum is ${MAX_CUSTOM_ITEMS}. Remove ${draft.customItems.length - MAX_CUSTOM_ITEMS}.`;
+      return;
+    }
   }
 
   const saveButton = document.getElementById('cfg-save');
@@ -933,8 +1284,7 @@ function updateTopbar() {
      ${room.expectedPlayers ? `<span class="status-pill">expected ~${room.expectedPlayers}</span>` : ''}
      <span class="status-pill">${calledList.length}/${room.config.poolSize} called</span>
      <span class="spacer"></span>
-     ${room.status === 'playing' && !isHost() ? '<span class="status-pill">🎙️ host is calling</span>' : ''}
-     <span class="status-pill">${isHost() ? '🎙️ Hosting' : esc((viewer && viewer.avatar) || '') + ' ' + esc(viewer ? viewer.name : '')}</span>
+     ${room.status === 'playing' && !isHost() ? '<span class="status-pill">🎙️ host is calling</span>' : ''}      <span class="status-pill">${isHost() ? '🎙️ Hosting' : avatarFace((viewer && viewer.avatar) || '', 'pill-avatar') + ' ' + esc(viewer ? viewer.name : '')}</span>
      <button class="ghost small" id="leave">${isHost() ? 'Close table' : 'Leave table'}</button>`
   );
   if (changed) attachTopbarHandlers();
@@ -1004,7 +1354,7 @@ function updateStadium() {
       return `<button class="seat ${selectedTarget === p.id ? 'selected' : ''} ${p.online ? '' : 'idle'}"
                 style="left:${x}%;top:${y}%" data-avatar-id="${p.id}" data-target="${p.id}"
                 title="${esc(p.name)}">
-                <span class="seat-face">${esc(p.avatar || '🙂')}</span>
+                ${avatarFace(p.avatar, 'seat-face')}
                 <span class="seat-name">${esc(p.name)}</span>
               </button>`;
     })
@@ -1020,6 +1370,14 @@ function updateStadium() {
         <span class="table-name">${esc(room.hostName || 'Host')}</span>
         <span class="table-call">${lastCalled !== null ? esc(itemLabel(lastCalled)) : '·'}</span>
         <span class="table-label">${room.status === 'playing' ? `${calledList.length}/${room.config.poolSize} called` : STATUS_LABEL[room.status]}</span>
+        ${
+          room.status === 'playing' && calledList.length
+            ? `<div class="table-recent" aria-label="latest calls">${calledList
+                .slice(-6)
+                .map((index) => `<span class="recent-chip">${esc(itemLabel(index))}</span>`)
+                .join('')}</div>`
+            : ''
+        }
       </div>
       <div class="fly-layer" id="fly-layer"></div>
     </div>
@@ -1242,7 +1600,7 @@ function updateRoster() {
       ${shown
         .map(
           (p) => `<li class="player ${selectedTarget === p.id ? 'you' : ''}">
-            <span class="avatar-mini">${esc(p.avatar || '🙂')}</span>
+            ${avatarFace(p.avatar, 'avatar-mini')}
             <span class="name">${esc(p.name)}</span>
             <span class="badges">${p.online ? '' : '<span class="badge">idle</span>'}</span>
           </li>`
@@ -1289,7 +1647,7 @@ function updateLeaderboard() {
           const pct = e.bestTotal ? Math.round((e.bestDone / e.bestTotal) * 100) : 0;
           return `<li class="player ${e.isYou ? 'you' : ''}">
             <span class="rank">#${e.rank}</span>
-            <span class="avatar-mini">${esc(e.avatar || '🙂')}</span>
+            ${avatarFace(e.avatar, 'avatar-mini')}
             <span class="name">${esc(e.name)}${e.isYou ? ' (you)' : ''}</span>
             <span class="badges">
               <span class="badge ${e.won > 0 ? 'win' : ''}">${e.won}/${leaderboard.patternsTotal} won</span>
@@ -1312,11 +1670,13 @@ function updateSocial() {
   pieceSigs['social-panel'] = sig;
 
   const target = roster && selectedTarget ? roster.players.find((p) => p.id === selectedTarget) : null;
+  const cooldownMs = Math.max(0, reactionCooldownUntil - Date.now());
+  const cooldownLeft = Math.ceil(cooldownMs / 1000);
 
   panel.innerHTML = `
     <div class="panel-head">
       <h2>Table talk</h2>
-      <span class="hint">${room.config.chat ? `${CHAT_WORD_LIMIT} words max` : 'chat off'}${room.config.reactions ? ' · tap a seat to react' : ''}</span>
+      <span class="hint">${room.config.chat ? `${CHAT_WORD_LIMIT} words max` : 'chat off'}${room.config.reactions ? ' · tap a seat to react · 1/min each' : ''}</span>
     </div>
     <div class="social-grid">
       ${
@@ -1327,7 +1687,7 @@ function updateSocial() {
                   .slice(-40)
                   .map(
                     (m) => `<p class="chat-line ${viewer && m.playerId === viewer.id ? 'mine' : ''}">
-                      <span class="chat-avatar">${esc(m.avatar || '🙂')}</span>
+                      ${avatarFace(m.avatar, 'chat-avatar')}
                       <span class="chat-name">${esc(m.name)}</span>
                       <span class="chat-body">${esc(m.body)}</span>
                     </p>`
@@ -1345,9 +1705,19 @@ function updateSocial() {
       ${
         room.config.reactions
           ? `<div class="reactions">
-              <p class="hint">${target ? `Send to <strong>${esc(target.name)}</strong>` : 'Tap a seat in the stadium to pick someone'}</p>
+              <p class="hint">
+                ${
+                  cooldownMs > 0
+                    ? `⏳ One emoji a minute — <strong id="react-count">${cooldownLeft}s</strong> until you can send again`
+                    : target
+                      ? `Send to <strong>${esc(target.name)}</strong>`
+                      : 'Tap a seat in the stadium to pick someone'
+                }
+              </p>
               <div class="emoji-row">
-                ${REACTION_EMOJIS.map((e) => `<button type="button" class="emoji-btn" data-emoji="${e}" ${target ? '' : 'disabled'}>${e}</button>`).join('')}
+                ${REACTION_EMOJIS.map(
+                  (e) => `<button type="button" class="emoji-btn" data-emoji="${e}" ${target && cooldownMs === 0 ? '' : 'disabled'}>${e}</button>`
+                ).join('')}
               </div>
             </div>`
           : ''
@@ -1404,19 +1774,54 @@ async function sendReaction(emoji) {
     toast('Tap a seat first to choose who gets the emoji.');
     return;
   }
+  const waiting = reactionCooldownUntil - Date.now();
+  if (waiting > 0) {
+    toast(`One emoji a minute — ${Math.ceil(waiting / 1000)}s to go.`);
+    return;
+  }
   const { ok, data } = await api(`/api/room/${state.room.code}/react`, {
     method: 'POST',
     body: { to: selectedTarget, emoji },
   });
   if (!ok) {
+    if (data && data.error === 'rate_limited') {
+      reactionCooldownUntil = Date.now() + (data.retryInMs || 60000);
+      startReactionCooldown();
+      pieceSigs['social-panel'] = '';
+      updateSocial();
+    }
     toast(messageFor(data));
     return;
   }
+  // The table counts it: one emoji per player per minute.
+  reactionCooldownUntil = Date.now() + (data.cooldownMs || 60000);
+  startReactionCooldown();
   selectedTarget = null;
   pieceSigs['stadium-panel'] = '';
+  pieceSigs['social-panel'] = '';
   updateStadium();
   await refreshSocial();
   updateSocial();
+}
+
+/** Ticks the cooldown down, then re-enables the emoji row when it expires. */
+let reactionCooldownTimer = null;
+function startReactionCooldown() {
+  if (reactionCooldownTimer) return;
+  reactionCooldownTimer = setInterval(() => {
+    const left = reactionCooldownUntil - Date.now();
+    const counter = document.getElementById('react-count');
+    if (counter && left > 0) counter.textContent = `${Math.ceil(left / 1000)}s`;
+    if (left <= 0 || !state || !state.room) {
+      clearInterval(reactionCooldownTimer);
+      reactionCooldownTimer = null;
+      reactionCooldownUntil = 0;
+      if (state && state.room) {
+        pieceSigs['social-panel'] = '';
+        updateSocial();
+      }
+    }
+  }, 1000);
 }
 
 async function refreshSocial() {
@@ -1635,6 +2040,7 @@ async function ensurePool() {
   poolVersion = data.version;
   pieceSigs['card-panel'] = '';
   pieceSigs['board-panel'] = '';
+  if (state && state.room && state.room.status === 'lobby' && isHost() && !configDirty) fillItemsFromPool();
 }
 
 async function refreshRosterIfStale() {

@@ -19,6 +19,16 @@
   box-sizing: border-box;
 }
 
+/*
+ * The single display switch the studio relies on: `applyVisibility()` and
+ * `setContentFields()` add this class to hide settings that have no meaning for
+ * the chosen configuration (interval without auto-calling, pattern grid with a
+ * single winner, the list editor for a numbers board).
+ */
+.hidden {
+  display: none !important;
+}
+
 html,
 body {
   margin: 0;
@@ -249,7 +259,7 @@ button.small {
 
 @media (max-width: 880px) {
   .layout {
-    grid-template-columns: 1fr;
+    grid-template-columns: minmax(0, 1fr);
   }
 }
 
@@ -285,7 +295,7 @@ button.small {
 
 .column-labels {
   display: grid;
-  grid-template-columns: repeat(var(--cols, 5), 1fr);
+  grid-template-columns: repeat(var(--cols, 5), minmax(0, 1fr));
   gap: 8px;
   margin-bottom: 8px;
 }
@@ -312,7 +322,7 @@ button.small {
 
 .board {
   display: grid;
-  grid-template-columns: repeat(var(--cols, 5), 1fr);
+  grid-template-columns: repeat(var(--cols, 5), minmax(0, 1fr));
   gap: 6px;
 }
 
@@ -395,7 +405,7 @@ button.small {
 
 .card-grid {
   display: grid;
-  grid-template-columns: repeat(var(--cols, 5), 1fr);
+  grid-template-columns: repeat(var(--cols, 5), minmax(0, 1fr));
   gap: 7px;
 }
 
@@ -491,6 +501,7 @@ button.small {
 
 .player .name {
   font-weight: 700;
+  min-width: 0;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
@@ -859,9 +870,11 @@ ol.leaderboard {
   flex-direction: column;
   align-items: center;
   gap: 2px;
-  width: 34%;
-  padding: 14px 10px;
-  border-radius: 50%;
+  width: 38%;
+  min-width: 152px;
+  max-width: 330px;
+  padding: 14px 12px;
+  border-radius: 20px; /* the table itself, seated in the middle of the ring */
   text-align: center;
   background: linear-gradient(150deg, rgba(255, 77, 157, 0.22), rgba(123, 92, 255, 0.22));
   border: 1px solid var(--border);
@@ -893,6 +906,30 @@ ol.leaderboard {
   letter-spacing: 0.08em;
   text-transform: uppercase;
   color: var(--muted);
+}
+
+/* The last few calls sit on the felt like chips, so the centre reads as a
+   bingo table rather than a status badge. */
+.table-recent {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: center;
+  gap: 4px;
+  margin-top: 5px;
+}
+
+.recent-chip {
+  font-size: 0.6rem;
+  font-weight: 700;
+  line-height: 1.2;
+  padding: 2px 7px;
+  border-radius: 999px;
+  background: rgba(0, 0, 0, 0.34);
+  border: 1px solid var(--border);
+  max-width: 78px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .fly-layer {
@@ -1177,4 +1214,167 @@ ol.leaderboard {
 .card-grid[data-content='custom'] button {
   aspect-ratio: auto;
   min-height: 44px;
+}
+
+/* ------------------------------------------- host list editor (uploads) --- */
+
+#source-block {
+  margin: 2px 0 10px;
+}
+
+.item-tools {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+  margin: 6px 0 10px;
+}
+
+.upload-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.upload-btn input[type='file'] {
+  display: none;
+}
+
+.upload-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(104px, 1fr));
+  gap: 8px;
+  margin-bottom: 10px;
+}
+
+.upload-item {
+  position: relative;
+  margin: 0;
+  padding: 6px;
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+  background: rgba(0, 0, 0, 0.26);
+  border: 1px solid var(--border);
+  border-radius: 12px;
+}
+
+.upload-item img {
+  width: 100%;
+  aspect-ratio: 1 / 1;
+  object-fit: cover;
+  border-radius: 8px;
+  background: rgba(255, 255, 255, 0.06);
+}
+
+.upload-item figcaption input {
+  width: 100%;
+  font-size: 0.72rem;
+  padding: 5px 6px;
+}
+
+.upload-drop {
+  position: absolute;
+  top: 3px;
+  right: 3px;
+  width: 20px;
+  height: 20px;
+  padding: 0;
+  border-radius: 50%;
+  border: 1px solid var(--border);
+  background: rgba(10, 6, 28, 0.88);
+  color: var(--muted);
+  font-size: 0.64rem;
+  line-height: 1;
+  cursor: pointer;
+}
+
+.upload-drop:hover {
+  color: var(--danger);
+  border-color: var(--danger);
+}
+
+/* The count the host can never miss: green when the board is fully supplied. */
+.pool-status {
+  min-height: 1.1em;
+  margin-top: 4px;
+}
+
+.pool-status.ok {
+  color: var(--accent-3);
+}
+
+.pool-status.short {
+  color: var(--danger);
+  font-weight: 700;
+}
+
+/* ------------------------------------------------- photo avatars ---------- */
+
+.avatar-photo {
+  position: relative;
+  overflow: hidden;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.avatar-photo input[type='file'] {
+  display: none;
+}
+
+.avatar-photo img {
+  width: 26px;
+  height: 26px;
+  object-fit: cover;
+  border-radius: 7px;
+  display: block;
+}
+
+.seat-face.photo {
+  width: 30px;
+  height: 30px;
+  object-fit: cover;
+  border-radius: 50%;
+  display: block;
+}
+
+.avatar-mini.photo {
+  width: 24px;
+  height: 24px;
+  object-fit: cover;
+  border-radius: 50%;
+  display: inline-block;
+  vertical-align: middle;
+}
+
+.chat-avatar.photo {
+  width: 24px;
+  height: 24px;
+  object-fit: cover;
+  border-radius: 50%;
+}
+
+.pill-avatar.photo {
+  width: 1.2em;
+  height: 1.2em;
+  border-radius: 50%;
+  object-fit: cover;
+  vertical-align: -0.25em;
+}
+
+@media (max-width: 640px) {
+  .table-centre {
+    width: 46%;
+    padding: 10px 8px;
+    border-radius: 16px;
+  }
+
+  .table-recent {
+    display: none;
+  }
+
+  .recent-chip {
+    display: none;
+  }
 }

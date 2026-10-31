@@ -7,6 +7,8 @@
 //
 // Run against a live `npm run dev` server.
 
+import { AVATAR_CHOICES } from '../public/game.js';
+
 const BASE = process.env.BASE_URL || 'http://127.0.0.1:3000';
 const withScale = process.argv.includes('--scale');
 const SCALE_PLAYERS = Number(process.env.SCALE_PLAYERS || 500);
@@ -129,6 +131,12 @@ section('Static assets');
   check('the stylesheet covers the stadium, chat and reactions',
     css.includes('.stadium') && css.includes('.fly-emoji') && css.includes('.chat-log') && css.includes('.cell-image'),
     'stadium/chat/emoji/content rules missing');
+  check('the stylesheet covers the content editor, uploads and cooldown',
+    css.includes('.upload-grid') && css.includes('.upload-item') && css.includes('.avatar-option') && css.includes('.pool-status'),
+    'content editor rules missing');
+  // The studio hides settings with this class; without the rule the form shows
+  // settings that do not apply.
+  check('the display switch the studio toggles actually hides things', /\.hidden\s*\{[^}]*display:\s*none/.test(css), '.hidden rule missing from the stylesheet');
 
   const spa = await fetch(`${BASE}/deep/link`);
   check('unknown paths fall back to the SPA shell', spa.status === 200 && (await spa.text()).includes('Bingo Tables'));
@@ -782,11 +790,117 @@ section('Emoji reactions between players');
   const scroll = await api(`/api/room/${room.code}/reactions?since=${seenByThird.data.cursor}`);
   check('a caught-up reader gets no repeats', scroll.data.reactions.length === 0, String(scroll.data.reactions?.length));
 
+  // One emoji per player per minute — the limiter is what keeps reactions a
+  // gesture instead of a stream.
+  const again = await api(`/api/room/${room.code}/react`, { method: 'POST', body: { to: bobId, emoji: '🔥' }, token: alice.token });
+  check('a second emoji from the same player is refused', again.status === 429 && again.data.error === 'rate_limited', `${again.status} ${again.data?.error}`);
+  check('the refusal says how long to wait', Number(again.data.retryInMs) > 0 && Number(again.data.retryInMs) <= 60000, JSON.stringify(again.data));
+  const afterLimit = await api(`/api/room/${room.code}/reactions?since=0`, { token: alice.token });
+  check('a refused emoji is never stored', afterLimit.data.reactions.length === 1, String(afterLimit.data.reactions?.length));
+
+  const bobBack = await api(`/api/room/${room.code}/react`, { method: 'POST', body: { to: aliceId, emoji: '😂' }, token: bob.token });
+  check('the one-a-minute limit is per player, not per room', bobBack.status === 200 && bobBack.data.ok === true, `${bobBack.status} ${bobBack.data?.error}`);
+  check('an accepted reaction reports the cooldown to the client', Number(bobBack.data.cooldownMs) === 60000, String(bobBack.data?.cooldownMs));
+
   const off = await newRoom('Host', { reactions: false });
   const quiet = await join(off.code, 'Quiet');
   const offRoster = await api(`/api/room/${off.code}/players`);
   const postOff = await api(`/api/room/${off.code}/react`, { method: 'POST', body: { to: offRoster.data.players[0].id, emoji: '🎉' }, token: quiet.token });
   check('reactions can be switched off by the host', postOff.status === 403 && postOff.data.error === 'reactions_disabled', `${postOff.status} ${postOff.data?.error}`);
+}
+
+// --------------------------------------------- host-supplied pools -------
+
+section('The host can supply their own items for any non-numeric board');
+{
+  const mine = Array.from({ length: 30 }, (_, i) => ({ label: `Photo ${i + 1}`, media: `https://example.com/p${i + 1}.png` }));
+  const room = await newRoom('Host', { content: 'names', rows: 3, cols: 5, customItems: mine });
+  check('a names board accepts the host list', room.res.status === 200 && room.res.data.room.config.content === 'names', `${room.res.status} ${room.res.data?.error}`);
+  const pool = await api(`/api/room/${room.code}/pool`, { token: room.hostToken });
+  check('the host list is what gets called', pool.data.items.every((i) => i.label.startsWith('Photo')), JSON.stringify(pool.data.items.slice(0, 2)));
+  check('host items keep their image links', pool.data.items.every((i) => i.media.startsWith('https://')), JSON.stringify(pool.data.items[0]));
+  check('the list is trimmed to whole columns', pool.data.items.length === 30 && pool.data.poolSize === 30, `${pool.data.items.length}/${pool.data.poolSize}`);
+
+  // Re-saving a setting that has nothing to do with the pool keeps the list.
+  const kept = await setConfig(room.code, room.hostToken, { callIntervalMs: 8000 });
+  check('saving without resending the list keeps it', kept.status === 200 && kept.data.room.config.content === 'names', `${kept.status} ${kept.data?.error}`);
+  const unchanged = await api(`/api/room/${room.code}/pool`, { token: room.hostToken });
+  check('an untouched pool keeps its version', unchanged.data.version === pool.data.version, `${pool.data.version} → ${unchanged.data.version}`);
+  check('the kept pool is still the host list', unchanged.data.items.every((i) => i.label.startsWith('Photo')), JSON.stringify(unchanged.data.items.slice(0, 2)));
+
+  // Uploaded pictures: a caption is optional, the picture is the cell.
+  const png = `data:image/jpeg;base64,${'A'.repeat(64)}`;
+  const uploads = Array.from({ length: 9 }, () => ({ label: '', media: png }));
+  const photos = await newRoom('Host', { content: 'images', rows: 3, cols: 3, customItems: uploads });
+  check('an image-only cell needs no caption', photos.res.status === 200, `${photos.res.status} ${photos.res.data?.error}`);
+  const uploadPool = await api(`/api/room/${photos.code}/pool`, { token: photos.hostToken });
+  check('the uploaded picture is what the cell holds', uploadPool.data.items.every((i) => i.label === '' && i.media.startsWith('data:image/')), JSON.stringify(uploadPool.data.items[0]));
+  const player = await join(photos.code, 'Snapper');
+  check('a picture board still deals a playable card', player.card.length === 3 && player.card[0].length === 3, JSON.stringify(player.card));
+
+  const blank = await newRoom('Host', { content: 'images', rows: 3, cols: 3, customItems: Array.from({ length: 9 }, () => ({ label: '', media: '' })) });
+  check('a list where nothing is usable is refused, not silently swapped', blank.res.status === 400 && blank.res.data.error === 'invalid_items', `${blank.res.status} ${blank.res.data?.error}`);
+  const blanks = await newRoom('Host', { content: 'images', rows: 3, cols: 3, customItems: ['  ', '', null] });
+  check('the same rule covers typed blanks', blanks.res.status === 400 && blanks.res.data.error === 'invalid_items', `${blanks.res.status} ${blanks.res.data?.error}`);
+  const builtin = await newRoom('Host', { content: 'images', rows: 3, cols: 3, customItems: [] });
+  check('an empty list still means the built-in pool', builtin.res.status === 200, `${builtin.res.status} ${builtin.res.data?.error}`);
+
+  const fat = await newRoom('Host', {
+    content: 'images',
+    rows: 3,
+    cols: 3,
+    customItems: Array.from({ length: 9 }, () => ({ label: '', media: `data:image/jpeg;base64,${'A'.repeat(6000)}` })),
+  });
+  check('an oversized upload as text is refused', fat.res.status === 400 && fat.res.data.error === 'image_too_large', `${fat.res.status} ${fat.res.data?.error}`);
+
+  const flooded = await newRoom('Host', {
+    content: 'images',
+    rows: 3,
+    cols: 3,
+    customItems: Array.from({ length: 100 }, () => ({ label: '', media: `data:image/jpeg;base64,${'A'.repeat(4800)}` })),
+  });
+  check('a pool far past the room row budget is refused', flooded.res.status === 400 && flooded.res.data.error === 'items_too_large', `${flooded.res.status} ${flooded.res.data?.error}`);
+
+  const overlong = await newRoom('Host', { content: 'custom', rows: 3, cols: 3, customItems: Array.from({ length: 301 }, (_, i) => `T${i}`) });
+  check('an over-long list is refused', overlong.res.status === 400 && overlong.res.data.error === 'too_many_items', `${overlong.res.status} ${overlong.res.data?.error}`);
+
+  // Switching the type must never inherit the previous host list.
+  const switched = await setConfig(room.code, room.hostToken, { content: 'images' });
+  check('switching type is accepted', switched.status === 200 && switched.data.room.config.content === 'images', `${switched.status} ${switched.data?.error}`);
+  const fresh = await api(`/api/room/${room.code}/pool`, { token: room.hostToken });
+  check('the switch bumps the pool version', fresh.data.version !== unchanged.data.version, `${unchanged.data.version} → ${fresh.data.version}`);
+  check('the old host list never leaks into the new type', fresh.data.items.every((i) => i.media === ''), JSON.stringify(fresh.data.items.slice(0, 2)));
+
+  const back = await setConfig(room.code, room.hostToken, { content: 'numbers' });
+  const numeric = await api(`/api/room/${room.code}/pool`, { token: room.hostToken });
+  check('numbers regenerates its own pool', back.status === 200 && numeric.data.items.every((i) => /^\d+$/.test(i.label)), JSON.stringify(numeric.data.items.slice(0, 2)));
+}
+
+// --------------------------------------------------------- avatars -------
+
+section('Player avatars: an emoji or a small photo');
+{
+  const room = await newRoom('Host');
+  const photo = `data:image/jpeg;base64,${'A'.repeat(120)}`;
+  const joined = await api(`/api/room/${room.code}/join`, { method: 'POST', body: { name: 'Snapper', avatar: photo } });
+  check('a small photo is accepted as the avatar', joined.status === 200 && joined.data.viewer.avatar === photo, `${joined.status} ${String(joined.data?.viewer?.avatar).slice(0, 24)}`);
+
+  const face = (name, body) =>
+    api(`/api/room/${room.code}/join`, { method: 'POST', body: { name, ...body } })
+      .then((res) => ({ res, avatar: res.data && res.data.viewer && res.data.viewer.avatar }))
+      .then(async (out) => ({ ...out, shown: (await api(`/api/room/${room.code}/players`)).data.players.find((p) => p.name === name)?.avatar }));
+
+  const big = await face('BigShot', { avatar: `data:image/png;base64,${'A'.repeat(4000)}` });
+  check('an oversized photo falls back to an emoji avatar', big.res.status === 200 && AVATAR_CHOICES.includes(big.shown), `${big.res.status} ${String(big.shown).slice(0, 24)}`);
+
+  const svg = await face('Sneaky', { avatar: `data:image/svg+xml;base64,${'A'.repeat(40)}` });
+  check('a non-raster avatar is refused, not rendered', svg.res.status === 200 && AVATAR_CHOICES.includes(svg.shown), String(svg.shown).slice(0, 24));
+
+  const html = await face('Joker', { avatar: 'data:text/html;base64,PHNjcmlwdD4=' });
+  check('a scripted avatar never reaches the roster', html.res.status === 200 && AVATAR_CHOICES.includes(html.shown), String(html.shown).slice(0, 24));
+
+  const picked = await face('Fox', { avatar: '🦊' });
+  check('a picked emoji is kept as-is', picked.shown === '🦊', String(picked.shown));
 }
 
 // ------------------------------------------------ expected vs actual ------

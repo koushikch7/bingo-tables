@@ -55,6 +55,17 @@ const CHAT_PAGE = 60;
 const CHAT_RETENTION_MS = 10 * 60 * 1000;
 const REACTION_PAGE = 40;
 const PRUNE_CHANCE = 0.1;
+/** One emoji per player per minute — reactions are gestures, not a stream. */
+const REACTION_COOLDOWN_MS = 60 * 1000;
+/** Photo avatars are small data URLs, so the roster stays a reasonable size. */
+const AVATAR_PHOTO_MAX = 2000;
+const AVATAR_PHOTO_RE = /^data:image\/(?:png|jpe?g|webp|gif);base64,[A-Za-z0-9+/]+={0,2}$/;
+
+/** A player may arrive with a picked emoji or a small uploaded photo. */
+function photoAvatar(value) {
+  const raw = typeof value === 'string' ? value : '';
+  return raw && raw.length <= AVATAR_PHOTO_MAX && AVATAR_PHOTO_RE.test(raw) ? raw : null;
+}
 
 /** Hot-path column list — deliberately excludes `items` (the biggest column). */
 const ROOM_COLUMNS = `id, code, host_player_id, host_name, status, round, seed, rows, cols, content,
@@ -412,20 +423,32 @@ async function updateConfig(request, env, code, token) {
 
   const current = roomConfig(room);
   const requested = body.config && typeof body.config === 'object' ? body.config : body;
+  const wantedContent = requested.content !== undefined ? requested.content : current.content;
 
-  // A custom list is stored in the room's item pool; if the host did not resend
-  // it, reuse what is already there.
-  if (requested.content === 'custom' && requested.customItems === undefined) {
-    const stored = await env.DB.prepare('SELECT items FROM rooms WHERE id = ?').bind(room.id).first();
-    requested.customItems = JSON.parse((stored && stored.items) || '[]');
+  // The item pool lives in the room row. If the host did not resend it, reuse
+  // what is already stored — but only when the content type still matches, so
+  // switching numbers → images can never inherit the old numbers pool.
+  const stored = await env.DB.prepare('SELECT items, content FROM rooms WHERE id = ?').bind(room.id).first();
+  const storedItems = (stored && stored.items) || '[]';
+  if (requested.customItems === undefined && wantedContent !== 'numbers' && stored && stored.content === wantedContent) {
+    let saved = [];
+    try {
+      saved = JSON.parse(storedItems);
+    } catch {
+      saved = [];
+    }
+    requested.customItems = Array.isArray(saved) ? saved : [];
   }
 
   const built = normalizeConfig(requested, current);
   if (built.error) return json({ error: built.error, message: built.message }, 400);
 
   const next = built.config;
+  // Any change to the callable pool (geometry, type, or the host's own list)
+  // bumps the version so every client refetches /pool exactly once.
   const geometryChanged =
     next.rows !== current.rows || next.cols !== current.cols || next.content !== current.content;
+  const poolChanged = geometryChanged || JSON.stringify(built.items) !== storedItems;
   const now = Date.now();
 
   await env.DB.prepare(
@@ -439,11 +462,10 @@ async function updateConfig(request, env, code, token) {
     next.rows,
     next.cols,
     next.content,
-    JSON.stringify(built.items),
-    next.perColumn,
-    next.poolSize,
-    geometryChanged ? 1 : 0,
-    next.freeCentre ? 1 : 0,
+    JSON.stringify(built.items),      next.perColumn,
+      next.poolSize,
+      poolChanged ? 1 : 0,
+      next.freeCentre ? 1 : 0,
     next.callMode,
     next.callIntervalMs,
     next.markMode,
@@ -567,7 +589,7 @@ async function joinRoom(request, env, code, token) {
   const playerId = crypto.randomUUID();
   const newToken = crypto.randomUUID();
   const name = sanitizeName(body.name, 'Player');
-  const avatar = AVATAR_CHOICES.includes(body.avatar) ? body.avatar : randomAvatar(`${playerId}${name}`);
+  const avatar = photoAvatar(body.avatar) || (AVATAR_CHOICES.includes(body.avatar) ? body.avatar : randomAvatar(`${playerId}${name}`));
 
   await env.DB.batch([
     env.DB.prepare(
@@ -742,6 +764,19 @@ async function postReaction(request, env, code, token) {
   if (!target || target.role !== 'player') return json({ error: 'unknown_player' }, 404);
 
   const now = Date.now();
+  // A reaction is a gesture, not a stream: one emoji per player per minute.
+  const last = await env.DB.prepare('SELECT MAX(at) AS at FROM reactions WHERE room_id = ? AND from_id = ?')
+    .bind(room.id, me.id)
+    .first();
+  const lastAt = last && Number(last.at);
+  if (lastAt && now - lastAt < REACTION_COOLDOWN_MS) {
+    const retryInMs = REACTION_COOLDOWN_MS - (now - lastAt);
+    return json(
+      { error: 'rate_limited', message: `One emoji a minute — try again in ${Math.ceil(retryInMs / 1000)}s.`, retryInMs },
+      429
+    );
+  }
+
   await env.DB.prepare(
     `INSERT INTO reactions (id, room_id, from_id, from_name, to_id, to_name, emoji, at)
      VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
@@ -753,7 +788,7 @@ async function postReaction(request, env, code, token) {
       .run();
   }
 
-  return json({ ok: true, cursor: await latestCursor(env, 'reactions', room.id) });
+  return json({ ok: true, cooldownMs: REACTION_COOLDOWN_MS, cursor: await latestCursor(env, 'reactions', room.id) });
 }
 
 async function getChat(env, code, since) {

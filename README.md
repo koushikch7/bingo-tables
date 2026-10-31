@@ -37,7 +37,7 @@ ever drift.
 
 | Setting | Options | Interlink |
 | --- | --- | --- |
-| **Card content** | Numbers, Names, Emoji/images, Music titles, Names+images, or your **own list** | own list only for "my own list" |
+| **Card content** | Numbers, Names, Emoji/images, Music titles, Names+images, or **your own list** — *Built-in pool* or *My own images & names* | every non-numeric type accepts your own list |
 | **Board size** | Rows 3–6 × Columns 3–10 — the item pool is derived automatically | drives the pattern list |
 | **Free centre** | On/off | only on odd × odd boards |
 | **Calling** | **Auto** on a timer (3s–20s) or **Manual**, where the host calls each item | interval hidden when manual |
@@ -60,6 +60,21 @@ total numbers      = numbers per column × columns
 So the classic **5 × 5** board is exactly standard 75-ball bingo (15 numbers per
 column, B-I-N-G-O). A **6 × 8** board for a big room produces 96 numbers, 12 per
 column. Every cell stays two digits so cards stay readable on a phone.
+
+### Your own names and pictures
+
+The studio builds a board from the shipped pool **or** from your own list — for
+Names, Emoji/images, Music titles, Names+images and My own list alike. Type the
+lines (`Name | link` optionally), **auto-fill** with numbers, names or emoji,
+or **upload pictures**: each one is downscaled in the browser to a small JPEG,
+gets an optional name field, and can be removed again with one click.
+
+Every picture is a legal cell on its own — a caption is optional, and on a
+Names+images board an upload is paired with a name automatically. The editor
+always shows the count for the board you have chosen (`8 of 15 items — add 7
+more`), and saving an under-filled board is refused right there instead of
+failing at the table. Each player can also pick an emoji **avatar** or upload a
+small photo of their own.
 
 ### Choosing a board for your group
 
@@ -132,7 +147,9 @@ progress. Tap a seat to aim at that player.
   Paginated and pruned to a 10-minute window, so a busy table never bloats.
 - **Reactions** — 20 emoji. Any player can throw one at any other player; it is
   visible to **everyone** and animates across the table, **flying from the
-  sender's seat to the receiver's**.
+  sender's seat to the receiver's**. It is a gesture, not a stream: **one emoji
+  per player per minute**, and the row counts the seconds down until you can send
+  again.
 
 Both can be switched off by the host, and the API answers `403` when they are.
 
@@ -171,6 +188,12 @@ scripts/
 docs/
   REQUIREMENTS.md  full requirements + implementation spec
 ```
+
+Verification: **39** unit tests, **217** end-to-end API checks (**226** with the
+500-player load run) and **121** browser checks that drive a real Chromium
+through the studio editor, every content combination, the stadium layout and the
+reaction cooldown. See the matrix in
+[`docs/REQUIREMENTS.md`](docs/REQUIREMENTS.md#8-verification-matrix).
 
 ### How this scales to 500 players
 

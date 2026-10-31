@@ -266,41 +266,81 @@ capped and unlimited rounds".*
 
 ---
 
-### 3.8 Content types (what goes on the card) — R-08
+### 3.8 Content types and host-supplied cards — R-08
 
-> **R-08** The host chooses what the bingo card is made of, and can add their
-> own combinations.
+> **R-08** The host chooses what the bingo card is made of — a shipped pool, or
+> their **own names, titles and pictures** for any non-numeric type.
 
-| `content` | Pool | Notes |
+| `content` | Shipped pool | Host list (typed *or* uploaded) |
 |---|---|---|
-| `numbers` | 1 … `perColumn × cols` | classic 75-ball at 5×5; always 2-digit max (`MAX_NUMBER = 99`) |
-| `names` | 80 built-in names | |
-| `images` | 90 emoji | each cell is an emoji glyph |
-| `music` | 65 public-domain / folk titles | `media` field reserved for a link |
-| `mixed` | name + image pairs | "names and images bingo" |
-| `custom` | host's own list | one item per line, or `Label \| link`; ≤ 300 items; label ≤ 40 chars, media ≤ 300 chars |
+| `numbers` | 1 … `perColumn × cols` | not applicable — always generated (2-digit max, `MAX_NUMBER = 99`) |
+| `names` | 80 names | ✓ names |
+| `images` | 90 emoji | ✓ pictures, or emoji |
+| `music` | 65 public-domain / folk titles | ✓ titles |
+| `mixed` | 80 name + image pairs | ✓ picture **with** a name, or `Label \| link` |
+| `custom` | — | ✓ the list *is* the board |
 
 **Acceptance criteria**
-- All six types flow through the same card/pattern/win engine — cells store
-  pool **indices**, so nothing else changes.
-- A pool too small for the chosen geometry is refused:
-  **400 `pool_too_small`**, with a message telling the host how many items per
-  column are needed (`minimumPoolSize = rows × cols`).
+- All six types flow through the same card/pattern/win engine — cells store pool
+  **indices**, so nothing else changes.
+- **A host list always wins** for a non-numeric type: the typed lines and the
+  uploaded pictures become the pool, for `names`, `images`, `mixed` and `custom`
+  alike. `numbers` stays machine-generated — a list can never turn a numbers
+  board into something else.
+- **An item may be a picture with no caption** — the cell shows the picture
+  (`.cell-image`) and a caption (`.cell-text`) is optional. On a `mixed` board an
+  upload is paired with a name automatically.
+- Items are `Label \| link` lines and/or uploaded pictures, bounded to keep the
+  room row small:
+  - label ≤ 40 chars, pasted link ≤ **300** chars (`MEDIA_LINK_MAX`);
+  - an uploaded picture is downscaled **in the browser** (≤ 96 px, JPEG) and must
+    stay under **5 KB** of text (`MEDIA_DATA_MAX`) → **400 `image_too_large`**;
+  - the whole pool must stay under **400 KB** (`MAX_POOL_BYTES`) → **400
+    `items_too_large`**;
+  - ≤ **300** items (`MAX_CUSTOM_ITEMS`) → **400 `too_many_items`**.
+- A non-empty list in which **nothing is usable** is refused with **400
+  `invalid_items`** rather than quietly swapped for the shipped pool. An
+  explicitly empty list (`[]`) means "use the shipped pool" — which is exactly
+  what the *Built-in pool* choice sends, so switching back to it never leaks the
+  host's old pictures into the new board.
+- A pool too small for the chosen geometry is refused: **400 `pool_too_small`**,
+  telling the host how many items a `rows × cols` board needs
+  (`minimumPoolSize = rows × cols`) and, for a host list, how many per column.
+- The host list persists and is re-opened in the editor: saving settings without
+  resending `customItems` keeps what the host supplied (text in the textarea,
+  pictures as thumbnails).
+- `pool_version` bumps **only when the pool actually changes** — type, geometry
+  or items — so a client refetches `GET /pool` once and then receives the tiny
+  `{ changed: false }` reply. Switching type (`names` → `images`) always bumps it
+  and can never inherit the previous list.
 - The pool is sent to clients from a **separate** `GET /pool` endpoint with its
   own version cursor, so a 500-player room does not re-send 90 items on every
   poll.
-- Custom lists persist: re-saving config without resending `customItems` keeps
-  what the host already typed.
+- The editor shows the count **on every content type, always**:
+  `8 of 15 items — add 7 more (type them, auto-fill, or upload pictures).` or
+  `15 of 15 items ✓ — 15 uploaded pictures, every cell is covered.` Saving an
+  under-filled board is refused in the browser with the exact number missing
+  *and* re-checked on the server.
 
-**Implementation** `public/game.js` → `CONTENT_TYPES`, `poolFor()`,
-`buildPool()`, `normaliseItem()`, `minimumPoolSize()`; `src/worker.js` →
-`getPool()`, `updateConfig()` item persistence.
+**Implementation** `public/game.js` → `CONTENT_TYPES`, `poolFor()`, `buildPool()`,
+`normaliseItem()`, `minimumPoolSize()`, `MAX_CUSTOM_ITEMS`, `MEDIA_LINK_MAX`,
+`MEDIA_DATA_MAX`, `MAX_POOL_BYTES`; `src/worker.js` → `getPool()`,
+`updateConfig()` (item persistence, `pool_version`); `public/app.js` →
+`renderStudioPanel()`, `setContentFields()`, `updatePoolStatus()`,
+`fillItemsFromPool()`, `renderUploadGrid()`, `shrinkImage()`,
+`handleUploadFiles()`, `draftItems()`; `public/styles.css` → `.upload-grid`,
+`.upload-item`, `.pool-status`, `.hidden`.
 
-**Verified by** unit tests *("every content type builds a pool sized to the
-board", "custom lists are normalised and truncated", "a pool smaller than the
-board is refused")* + smoke: *all six content types configured and started,
-custom list accepted, too-small custom list refused, pool endpoint serves and
-caches by version.*
+**Verified by** unit tests *("a host list replaces the built-in pool for every
+non-numeric type", "a picture with no caption is a legal item, and unusable rows
+are dropped", "an unusable host list is refused instead of falling back to the
+built-in pool", "normalizeConfig refuses uploads that are too big or too many",
+"a host list covering exactly the board is accepted at every geometry")* + smoke:
+*host list accepted and kept across saves, image-only cells, oversized /
+over-long / over-budget lists refused, a type switch replaces the list, numbers
+regenerates its own* + browser: *every type configured through the editor (source
+radios, auto-fill, 15 uploaded pictures, clear), the count on every type, and
+the cells each type renders on a real card.*
 
 ---
 
@@ -378,6 +418,19 @@ expected is allowed.*
 count updates on join and leave, the roster cursor short-circuits unchanged
 reads.*
 
+**Avatars (part of joining).** A player picks one of the 30 shipped emoji
+(`AVATAR_CHOICES`) **or** uploads a small photo. A photo must be a raster data
+URL (`png`, `jpeg`, `webp`, `gif`) of at most 2 KB (`AVATAR_PHOTO_MAX`);
+anything else — oversized, SVG, non-image — is dropped and the player is given a
+stable emoji avatar instead, so no unvalidated markup can reach the roster.
+Photos are stored on the seat and drawn wherever an avatar appears: seat, roster,
+chat, leaderboard and topbar (`avatarFace()`).
+
+**Verified by** smoke: *a small photo is accepted as the avatar, an oversized
+photo falls back to an emoji avatar, a non-raster avatar is refused, a scripted
+avatar never reaches the roster, a picked emoji is kept as-is* + browser: *a photo
+avatar is drawn as an image on its seat and in the roster.*
+
 ---
 
 ### 3.12 Chat, max 20 words — R-12
@@ -426,6 +479,11 @@ disabled.*
 - The stored reaction carries `fromId`, `fromName`, `toId`, `toName`, `emoji`
   — both ids, so the client can animate the flight without extra lookups.
 - Everyone polling `GET /reactions?since=` receives it and animates it.
+- **One emoji per player per minute** (`REACTION_COOLDOWN_MS = 60 s`): a second
+  attempt → **429 `rate_limited`** with `retryInMs`, and nothing is stored. The
+  limit is per sender — everyone else can still react.
+- An accepted reaction answers with `cooldownMs`, and the client disables the
+  emoji row and counts the seconds down (`#react-count`) until it expires.
 - `reactions = false` → **403 `reactions_disabled`** and `enabled: false`.
 - Cursor-based reads (40 per page) with a 10-minute retention window.
 
@@ -440,14 +498,20 @@ disabled.*
 Because the host has no seat, a reaction can never be aimed at them; if the
 receiver is off the ring cap the flight degrades to the toast only.
 
-**Implementation** `src/worker.js` → `postReaction()`, `getReactions()`;
-`public/app.js` → `sendReaction()`, `refreshSocial()`, `playReactionFlight()`;
+**Implementation** `src/worker.js` → `postReaction()`, `getReactions()`,
+`REACTION_COOLDOWN_MS`; `public/app.js` → `sendReaction()`,
+`startReactionCooldown()`, `refreshSocial()`, `playReactionFlight()`;
 `public/styles.css` → `.fly-emoji`, `.fly-layer`.
 
 **Verified by** smoke: *a reaction needs a target, the host cannot be targeted,
 only offered emoji are accepted, a reaction to another player is accepted,
 everyone can see it, it says who sent it to whom, it carries both ids for the
-flight, a caught-up reader gets no repeats, reactions can be switched off.*
+flight, a caught-up reader gets no repeats, a second emoji from the same player
+is refused with the wait, the refusal stores nothing, the limit is per player
+rather than per room, an accepted reaction reports the cooldown, reactions can be
+switched off* + browser: *picking a seat names the target, the emoji row goes
+live, sending one starts the visible minute-long cooldown, every button is
+disabled meanwhile and the countdown ticks down.*
 
 ---
 
@@ -471,9 +535,12 @@ flight, a caught-up reader gets no repeats, reactions can be switched off.*
 **Implementation** `public/app.js` → `updateStadium()`, `nodeForId()`;
 `public/styles.css` → `.stadium`, `.ring`, `.seat`, `.table-centre`.
 
-**Verified by** only indirectly — the roster and reaction-target checks (§3.11,
-§3.13) exercise the seat identity the animation depends on. The visual layout
-itself is **not** automated (see §7).
+**Verified by** browser measurements: *the table centre sits at the middle of the
+ring, seats sit left and right and above and below it, no seat overlaps the
+table, seats are spaced apart, every seat carries its player name, and a photo
+avatar is drawn as an image.* The roster and reaction-target checks (§3.11,
+§3.13) cover the seat identity the animation depends on; the arc of the flight
+itself is still a human eye check (§7).
 
 ---
 
@@ -569,6 +636,45 @@ leaderboard computed and paginated, claim in constant time.*
 
 ---
 
+### 3.19 The content editor — R-19
+
+> **R-19** A host never has to accept the shipped pool: any card can be built
+> from their own pictures and names, and the editor tells them exactly how many
+> items the board needs.
+>
+> *(The data rules behind this — limits, error codes, persistence — are in §3.8;
+> this section is the screen the host actually uses.)*
+
+**Acceptance criteria**
+- The studio offers a **source choice** for every non-numeric type — *Built-in
+  pool* or *My own images & names* — and a board of type `custom` is the host's
+  list by definition (no source choice is shown).
+- The list editor has **auto-fill** (`Numbers 1…N`, `Names`, `Emoji`), an
+  **upload** control (multiple images), a per-picture **name field** and a
+  **remove** button per picture, and **Clear**.
+- Opposite of the shipped-pool direction: choosing *My own* then **Clear** shows
+  `0 of <needed> items — add <needed> more`, and saving is blocked with
+  `Your list has N items — a RxC board needs M.`
+- Uploaded pictures are downscaled before they leave the browser
+  (`shrinkImage()`, JPEG ≤ 96 px, retried at lower quality until they fit) so a
+  normal camera photo becomes a small data URL instead of a rejection.
+- **A board is never saved without data**: the count is validated in the browser
+  and again on the server (§3.8), for every content type and every geometry.
+
+**Implementation** `public/app.js` → `renderStudioPanel()`,
+`contentChoices()`, `setSource()`, `listMode()`, `draftItems()`,
+`setContentFields()`, `updatePoolStatus()`, `isBuiltinPool()`,
+`fillItemsFromPool()`, `renderUploadGrid()`, `shrinkImage()`,
+`handleUploadFiles()`, `attachItemTools()`, `saveConfig()`.
+
+**Verified by** browser checks: *every type's source choice and count, auto-fill
+writing exactly 15 lines, 15 uploads producing 15 thumbnails and a covered
+board, a name typed onto a picture and stored with it, removing a picture
+dropping the board below the count, an empty and a half-filled list both refused,
+and the per-type cell rendering on a real card.*
+
+---
+
 ## 4. API reference
 
 All routes are under `/api`. Authentication is the `x-player-token` header
@@ -598,14 +704,14 @@ All routes are under `/api`. Authentication is the `x-player-token` header
 
 | Method | Path | Who | Notable errors |
 |---|---|---|---|
-| POST | `/config` | host, **lobby only** | 403 `host_only`, **409 `settings_locked`**, 400 `invalid_*` / `no_patterns` / `pool_too_small` |
+| POST | `/config` | host, **lobby only** | 403 `host_only`, **409 `settings_locked`**, 400 `invalid_*` / `invalid_items` / `no_patterns` / `pool_too_small` / `too_many_items` / `image_too_large` / `items_too_large` |
 | POST | `/start` | host | 403 `host_only` — no player-count gate |
 | POST | `/call` | host | 409 `already_called`, 400 `invalid_item` |
 | POST | `/mark` | player | 403 `host_cannot_play`, 409 `not_called` / `auto_mark_enabled`, 400 `not_on_card` |
 | POST | `/bingo` | player | 403 `host_cannot_play`, 409 `no_bingo` / `already_won` / `auto_winner_call` |
 | POST | `/end` | host | 403 `host_only` |
 | POST | `/chat` | any | 403 `chat_disabled`, 400 `too_many_words` / `empty_message` / `message_too_long` |
-| POST | `/react` | any | 403 `reactions_disabled`, 400 `invalid_emoji`, 404 `unknown_player` |
+| POST | `/react` | any | 403 `reactions_disabled`, **429 `rate_limited`** (1/min per player), 400 `invalid_emoji`, 404 `unknown_player` |
 
 ### `POST /config` body
 
@@ -614,7 +720,8 @@ All routes are under `/api`. Authentication is the `x-player-token` header
   "config": {
     "rows": 5, "cols": 5,              // 3-6 × 3-10
     "content": "numbers",              // numbers|names|images|music|mixed|custom
-    "customItems": ["Sunrise", "Moonlight | https://…"],  // custom only, ≤300
+    "customItems": ["Sunrise", "Moonlight | https://…", { "label": "Beach", "media": "data:image/jpeg;base64,…" }],
+                                        // any non-numeric type, ≤300; a caption is optional
     "freeCentre": true,                // odd×odd only
     "callMode": "auto",                // auto|manual
     "callIntervalMs": 5000,            // 3000|4000|5000|8000|12000|20000
@@ -712,17 +819,22 @@ always yields the same card on every device without transferring it.
 - **Host vs player**: `isHost()` swaps the main column between the settings
   studio (lobby) / live controls (playing) and the player's card.
 
-### Manual verification checklist (not automated)
+### Browser checks
 
-I cannot drive a browser from this environment, so the following are **untested
-by me** and worth a click-through in the preview:
+Layout and editor behaviour **is** driven by a real browser: a Playwright harness
+(kept outside the repository, in the development VM) points a Chromium at the
+local `wrangler dev` server and checks every content combination end to end —
+source radios, auto-fill, 15 uploaded pictures, the always-on count, the cells
+each type renders, the stadium geometry and the reaction cooldown. What is still
+worth a human click-through:
 
-1. Settings panel: switch content types, change rows/columns and confirm the
-   winning condition and pattern grid stay in sync.
-2. A full round on a phone-width screen at 6×8 — tap cells, watch the countdown.
-3. The flying emoji between two seats (select a seat → reaction → watch the arc).
-4. Chat counter behaviour at 19/20/21 words.
-5. The multi-winner results screen with names, ranks and patterns.
+1. A full round on a phone-width screen at 6×8 — tap cells, watch the countdown.
+2. The arc of the flying emoji between two seats (the plumbing around it is
+   checked, the animation itself is a visual).
+3. Chat counter behaviour at 19/20/21 words.
+4. The multi-winner results screen with names, ranks and patterns.
+5. Uploading a real camera photo (multi-megabyte JPEG/HEIC) and the downscale
+   quality that comes out of `shrinkImage()`.
 
 ---
 
@@ -730,9 +842,10 @@ by me** and worth a click-through in the preview:
 
 | Layer | Command | Result |
 |---|---|---|
-| Unit (rules, geometry, interlinks, pools, presets) | `npm test` | **33 / 33 pass** |
-| End-to-end API (every requirement above) | `node scripts/smoke.mjs` | **185 / 185 pass** |
-| + 500-player load run | `node scripts/smoke.mjs --scale` | **194 / 194 pass** |
+| Unit (rules, geometry, interlinks, pools, presets) | `npm test` | **39 / 39 pass** |
+| End-to-end API (every requirement above) | `node scripts/smoke.mjs` | **217 / 217 pass** |
+| + 500-player load run | `node scripts/smoke.mjs --scale` | **226 / 226 pass** |
+| Browser (studio editor, every content type, stadium, cooldown, photo join) | Playwright harness against the dev server | **121 / 121 pass** |
 | Syntax | `node --check` on all four sources | clean |
 | Server log | `dev.log` | no errors |
 
@@ -750,13 +863,26 @@ Bugs found and fixed during this work:
    now part of the signature.
 5. **Reaction target stayed selected after sending** — now cleared and
    re-rendered immediately instead of on the next poll.
+6. **The `hidden` class did nothing** — the studio hides settings that cannot
+   apply by toggling a `hidden` class, but the stylesheet had no rule for it, so
+   the list editor, the source radios and the pattern grid were all on screen at
+   once (for numbers *and* for a single-winner round). Added the rule, plus a
+   smoke check that it exists.
+7. **An unusable host list silently became the shipped pool** — a list whose
+   entries were all blank quietly fell back to built-in items instead of saying
+   so. Now **400 `invalid_items`**, while an explicitly empty list still means
+   "use the shipped pool".
 
 ---
 
 ## 9. Known limitations
 
-- **No browser automation in this environment** — UI behaviour is verified at
-  the HTTP/asset level only (§7 lists what to click).
+- **The browser harness is not part of the repository** — the Playwright checks
+  in §7/§8 run from outside the project (a Chromium install in the VM home), so
+  `npm test` alone does not cover the UI. CI would need its own browser step.
+- **A started round locks the settings for good.** Returning a finished table to
+  the lobby to reconfigure it is not supported yet — a host who wants different
+  content creates a new table.
 - **Nothing is committed or deployed.** A real deploy needs a provisioned D1
   `database_id` in `wrangler.toml` and a migration to replace the local schema
   guard.

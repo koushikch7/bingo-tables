@@ -5,7 +5,11 @@ import {
   ALLOWED_INTERVALS,
   CONTENT_TYPES,
   MAX_COLS,
+  MAX_CUSTOM_ITEMS,
+  MAX_POOL_BYTES,
   MAX_ROWS,
+  MEDIA_DATA_MAX,
+  MEDIA_LINK_MAX,
   MIN_COLS,
   MIN_ROWS,
   availablePatterns,
@@ -25,6 +29,7 @@ import {
   minimumPoolSize,
   missedCount,
   mulberry32,
+  normaliseItem,
   normalizeConfig,
   numbersPerColumn,
   patternCells,
@@ -114,6 +119,105 @@ test('custom lists are cleaned, trimmed and must be big enough', () => {
   assert.deepEqual(messy.items.map((i) => i.label), ['Spacey', 'Named', 'A', 'B', 'C', 'D']);
   assert.equal(messy.items[1].media, 'https://x/y.png', 'media links survive cleaning');
   assert.equal(messy.perColumn, 2);
+});
+
+test('a host list replaces the built-in pool for every non-numeric type', () => {
+  const mine = Array.from({ length: 24 }, (_, i) => ({ label: `Mine ${i + 1}`, media: `https://x/${i}.png` }));
+  for (const content of ['names', 'images', 'music', 'mixed']) {
+    const pool = buildPool({ content, rows: 3, cols: 4, customItems: mine });
+    assert.equal(pool.items.length, 24, `${content} uses the host list`);
+    assert.ok(pool.items.every((i) => i.label.startsWith('Mine')), `${content} keeps host labels`);
+    assert.ok(pool.items.every((i) => i.media.startsWith('https://')), `${content} keeps host links`);
+    assert.ok(pool.poolSize >= minimumPoolSize(3, 4), `${content} covers the board`);
+  }
+
+  // Numbers are machine-generated: an uploaded list never becomes a number board.
+  const numeric = buildPool({ content: 'numbers', rows: 3, cols: 3, customItems: mine });
+  assert.ok(numeric.items.every((i) => /^\d+$/.test(i.label)), JSON.stringify(numeric.items.slice(0, 3)));
+});
+
+test('a picture with no caption is a legal item, and unusable rows are dropped', () => {
+  const image = `data:image/jpeg;base64,${'A'.repeat(64)}`;
+  assert.deepEqual(normaliseItem({ label: '', media: image }), { label: '', media: image });
+  assert.deepEqual(normaliseItem('  Sunrise  '), { label: 'Sunrise', media: '' });
+  assert.deepEqual(normaliseItem({ label: '', media: '' }), null);
+  assert.equal(normaliseItem('   '), null);
+  assert.equal(normaliseItem(null), null);
+  assert.equal(normaliseItem(42), null);
+
+  // Junk rows are dropped and a picture row survives trimming without a caption.
+  const usable = Array.from({ length: 9 }, (_, i) => `Item ${i + 1}`);
+  const mixed = ['', '   ', null, 42, { label: '', media: '' }, { label: '', media: image }, ...usable];
+  const pool = buildPool({ content: 'custom', rows: 3, cols: 3, customItems: mixed });
+  assert.equal(pool.items.length, 9, 'the board is filled from the usable rows');
+  assert.deepEqual(pool.items[0], { label: '', media: image }, 'the picture is the cell');
+  assert.deepEqual(pool.items.slice(1).map((i) => i.label), usable.slice(0, 8));
+});
+
+test('item text is capped: a pasted link stays short, an upload is bounded', () => {
+  const longLink = normaliseItem({ label: 'A', media: `https://example.com/${'x'.repeat(500)}` });
+  assert.equal(longLink.media.length, MEDIA_LINK_MAX);
+  const image = `data:image/jpeg;base64,${'A'.repeat(MEDIA_DATA_MAX + 10)}`;
+  assert.equal(normaliseItem({ label: '', media: image }).media.length, MEDIA_DATA_MAX);
+});
+
+test('an unusable host list is refused instead of falling back to the built-in pool', () => {
+  const base = defaultConfig();
+  const blank = normalizeConfig({ content: 'images', rows: 3, cols: 3, customItems: Array.from({ length: 9 }, () => ({ label: '', media: '' })) }, base);
+  assert.equal(blank.error, 'invalid_items');
+  assert.match(blank.message, /name, a picture, or a link/);
+
+  // An explicitly empty list still means "use the built-in pool".
+  const builtin = normalizeConfig({ content: 'images', rows: 3, cols: 3, customItems: [] }, base);
+  assert.ok(builtin.config, 'an empty list keeps the shipped pool');
+  assert.ok(builtin.config.poolSize >= 9, `built-in pool covers the board (${builtin.config.poolSize})`);
+  assert.ok(builtin.items.every((i) => i.label.length > 0));
+
+  // Partly usable is a size problem, and says how many more are needed.
+  const few = normalizeConfig({ content: 'images', rows: 3, cols: 3, customItems: ['One', 'Two', '', null] }, base);
+  assert.equal(few.error, 'pool_too_small');
+});
+
+test('normalizeConfig refuses uploads that are too big or too many', () => {
+  const base = defaultConfig();
+  const huge = normalizeConfig(
+    { content: 'images', rows: 3, cols: 3, customItems: Array.from({ length: 9 }, () => ({ label: '', media: `data:image/png;base64,${'A'.repeat(MEDIA_DATA_MAX + 100)}` })) },
+    base
+  );
+  assert.equal(huge.error, 'image_too_large');
+  assert.match(huge.message, /KB/);
+
+  const many = normalizeConfig({ content: 'custom', customItems: Array.from({ length: MAX_CUSTOM_ITEMS + 1 }, (_, i) => `T${i}`) }, base);
+  assert.equal(many.error, 'too_many_items');
+
+  const bytes = normalizeConfig(
+    {
+      content: 'images',
+      rows: 3,
+      cols: 3,
+      customItems: Array.from({ length: 100 }, () => ({ label: '', media: `data:image/jpeg;base64,${'A'.repeat(MEDIA_DATA_MAX - 30)}` })),
+    },
+    base
+  );
+  assert.equal(bytes.error, 'items_too_large', 'the whole pool has to stay far under the row limit');
+  assert.ok(JSON.stringify(Array.from({ length: 100 }, () => ({ label: '', media: `data:image/jpeg;base64,${'A'.repeat(MEDIA_DATA_MAX - 30)}` }))).length > MAX_POOL_BYTES);
+});
+
+test('a host list covering exactly the board is accepted at every geometry', () => {
+  const base = defaultConfig();
+  for (let rows = MIN_ROWS; rows <= MAX_ROWS; rows += 1) {
+    for (let cols = MIN_COLS; cols <= MAX_COLS; cols += 1) {
+      const needed = rows * cols;
+      const items = Array.from({ length: needed }, (_, i) => ({ label: `N${i + 1}`, media: `https://x/${i}.png` }));
+      const built = normalizeConfig({ content: 'images', rows, cols, customItems: items }, base);
+      assert.ok(built.config, `${rows}x${cols} accepts exactly ${needed} items`);
+      assert.equal(built.config.poolSize, needed, `${rows}x${cols} pool covers the board`);
+      assert.ok(built.config.perColumn >= rows, `${rows}x${cols} gives each column a full draw`);
+
+      const short = normalizeConfig({ content: 'images', rows, cols, customItems: items.slice(0, needed - 1) }, base);
+      assert.equal(short.error, 'pool_too_small', `${rows}x${cols} refuses one item short`);
+    }
+  }
 });
 
 // ---------------------------------------------------------------- cards ----
