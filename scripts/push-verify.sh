@@ -24,7 +24,9 @@ echo "== pushing $branch ($local_head) =="
 git push "$repo_url" "HEAD:refs/heads/$branch"
 
 echo "== fetching back =="
-git fetch --no-tags "$repo_url" "refs/heads/$branch:refs/remotes/origin/$branch"
+# Leading '+' is required: after a rewritten history the old remote-tracking ref is
+# not an ancestor of the new tip, and a non-forced fetch rejects it (non-fast-forward).
+git fetch --no-tags "$repo_url" "+refs/heads/$branch:refs/remotes/origin/$branch"
 
 echo "== comparing trees =="
 if ! git diff --quiet "origin/$branch" HEAD; then
