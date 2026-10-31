@@ -879,13 +879,14 @@ Bugs found and fixed during this work:
 
 - **The browser harness is not part of the repository** — the Playwright checks
   in §7/§8 run from outside the project (a Chromium install in the VM home), so
-  `npm test` alone does not cover the UI. CI would need its own browser step.
+  `npm test` alone does not cover the UI. CI covers the unit and API layers only;
+  adding the UI suite would need a browser step and the harness committed here.
 - **A started round locks the settings for good.** Returning a finished table to
   the lobby to reconfigure it is not supported yet — a host who wants different
   content creates a new table.
-- **Nothing is committed or deployed.** A real deploy needs a provisioned D1
-  `database_id` in `wrangler.toml` and a migration to replace the local schema
-  guard.
+- **Nothing is deployed.** The code is committed and pushed (`master` plus the
+  feature branch), but a real deploy needs a provisioned D1 `database_id` in
+  `wrangler.toml` and a migration to replace the local schema guard.
 - Music cells carry a `media` field but no audio playback yet — the field is
   plumbed end to end for it.
 - Chat/reaction history is intentionally ephemeral (10-minute retention).

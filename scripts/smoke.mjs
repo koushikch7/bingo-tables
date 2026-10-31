@@ -9,7 +9,9 @@
 
 import { AVATAR_CHOICES } from '../public/game.js';
 
-const BASE = process.env.BASE_URL || 'http://127.0.0.1:3000';
+// Must match `npm run dev` (wrangler dev) — the suite is documented as running
+// right after it. Override with BASE_URL for another host or port.
+const BASE = process.env.BASE_URL || 'http://127.0.0.1:8787';
 const withScale = process.argv.includes('--scale');
 const SCALE_PLAYERS = Number(process.env.SCALE_PLAYERS || 500);
 

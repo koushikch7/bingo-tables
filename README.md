@@ -159,9 +159,13 @@ Both can be switched off by the host, and the API answers `403` when they are.
 npm install
 npm test                          # unit tests for the shared rules
 npm run dev                       # wrangler dev → http://localhost:8787
-node scripts/smoke.mjs            # end-to-end API suite
+node scripts/smoke.mjs            # end-to-end API suite (same port)
 node scripts/smoke.mjs --scale    # ...plus a 500-player load check
 ```
+
+The suite targets `http://127.0.0.1:8787` by default, which is where `npm run
+dev` listens — start the dev server in one terminal and run the suite in
+another. Point it somewhere else with `BASE_URL=http://host:port`.
 
 `wrangler dev` uses a **local** D1 database (SQLite under `.wrangler/`), so no
 cloud account or remote database is needed to develop or test.
@@ -185,12 +189,14 @@ test/
   game.test.js     unit tests for the rules
 scripts/
   smoke.mjs        end-to-end suite through the public HTTP API
+  push-verify.sh   push to GitHub, then prove the remote matches byte-for-byte
 docs/
   REQUIREMENTS.md  full requirements + implementation spec
 ```
 
 Verification: **39** unit tests, **217** end-to-end API checks (**226** with the
-500-player load run) and **121** browser checks that drive a real Chromium
+500-player load run) — the first two layers run in CI on every push — and
+**121** browser checks that drive a real Chromium
 through the studio editor, every content combination, the stadium layout and the
 reaction cooldown. See the matrix in
 [`docs/REQUIREMENTS.md`](docs/REQUIREMENTS.md#8-verification-matrix).
